@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#00070d">
+<title>Holo-Lock</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--c:#00e5ff;--bg:#00070d;--ok:#7dffb2;--bad:#ff3b5c}
+html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;font-family:"Orbitron","Trebuchet MS",sans-serif;color:var(--c)}
+#v{display:none;position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);opacity:.32;filter:grayscale(1) sepia(1) hue-rotate(150deg) saturate(3)}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;display:block}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(0,229,255,.05) 0 1px,transparent 1px 3px)}
+#ui{position:fixed;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top,0px) + 28px) 18px 0;text-align:center;pointer-events:none;z-index:2}
+h1{margin:0;font-size:17px;font-weight:700;letter-spacing:.4em;text-shadow:0 0 12px var(--c);animation:gl 5s infinite}
+#msg{margin-top:14px;font-size:14px;font-weight:500;letter-spacing:.12em;text-shadow:0 0 10px currentColor}
+#sub{margin-top:8px;font-size:11px;letter-spacing:.08em;opacity:.7}
+#bot{position:fixed;left:0;right:0;bottom:0;padding:0 10px calc(env(safe-area-inset-bottom,0px) + 22px);text-align:center;z-index:2}
+#live{font-size:12px;letter-spacing:.14em;min-height:16px;text-shadow:0 0 8px var(--c)}
+#chips{font-size:13px;letter-spacing:.1em;min-height:20px;margin:8px 0 14px;color:#fff;text-shadow:0 0 8px var(--c)}
+button{display:none;font:inherit;font-size:11px;letter-spacing:.1em;color:var(--c);background:rgba(0,229,255,.08);border:1px solid var(--c);padding:11px 16px;margin:4px;cursor:pointer;box-shadow:0 0 12px rgba(0,229,255,.35)}
+button:active{background:rgba(0,229,255,.25)}
+@keyframes gl{0%,92%,100%{transform:none}93%{transform:translateX(-3px);text-shadow:3px 0 #ff3b5c,-3px 0 #00e5ff}95%{transform:translateX(3px)}97%{transform:none}}
+@media (prefers-reduced-motion:reduce){h1{animation:none}}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="ui"><h1>HOLO-LOCK</h1><div id="msg"></div><div id="sub"></div></div>
+<div id="bot"><div id="live"></div><div id="chips"></div>
+<button id="sv">SAVE SEQUENCE</button><button id="cl">CLEAR</button><button id="cs">CHANGE SIGNS</button><button id="rf">RE-ENROLL FACE</button><button id="rv">RE-RECORD VOICE</button><button id="alt">USE SIGNS INSTEAD</button><button id="lk">LOCK AGAIN</button></div>
+<script type="module">
+import {FilesetResolver,HandLandmarker,FaceLandmarker} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const CDN="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",MD="https://storage.googleapis.com/mediapipe-models/";
+const TH=0.05; // face match limit: lower = stricter. Live score is shown on screen so you can tune it.
+const $=id=>document.getElementById(id),c=$('c'),x=c.getContext('2d'),v=$('v');
+let W,H,D=devicePixelRatio||1,t=0,last=0;
+function rs(){W=innerWidth;H=innerHeight;c.width=W*D;c.height=H*D;x.setTransform(D,0,0,D,0,0)}
+addEventListener('resize',rs);rs();
+let st='boot',face=null,seq=null,hd,fl,vReady=false,lastVT=-1,fr=null,hr=null,samples=[],sampT=0,holdT=0,gSeq=[],cur='',lastG='',armed=true,gT=0,flash=0,flashCol='#ff3b5c',grantT=0,score=null;
+try{face=JSON.parse(localStorage.getItem('hf'));seq=JSON.parse(localStorage.getItem('hs'))}catch(e){}
+if(seq&&seq.length&&typeof seq[0]==='string')seq=null; // old sign format: record signs again
+let embs=[],fmS=null,fmState='idle',fmErr=0,fcos=null,fcosT=0,fbusy=false,hfe=null,anc=null,acc=null,accN=0,lastV=null;
+try{hfe=JSON.parse(localStorage.getItem('hfe'))}catch(e){}
+const FT=0.5,ST=0.3,ORT='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';
+const FMU=['https://huggingface.co/immich-app/buffalo_s/resolve/main/recognition/model.onnx','https://huggingface.co/immich-app/buffalo_l/resolve/main/recognition/model.onnx'];
+let aud=null,vT=null,vTok=0,ac=null,recStart=0,recMs=0;const VF=1.2,EV=0.86,sl=ms=>new Promise(r=>setTimeout(r,ms));
+try{vT=JSON.parse(localStorage.getItem('hv'))}catch(e){}
+if(vT&&!vT.e)vT=null; // old template format: re-enroll voice
+const P=[...Array(45)].map(()=>({x:Math.random(),y:Math.random(),v:.01+Math.random()*.03,r:.5+Math.random()*1.5}));
+const say=(m,s,col)=>{$('msg').textContent=m;$('sub').textContent=s||'';$('msg').style.color=col||''};
+const show=(id,on)=>$(id).style.display=on?'inline-block':'none';
+const GN={'00000':'FIST','11111':'PALM','01000':'ONE','01100':'PEACE','01110':'THREE','01111':'FOUR','10000':'THUMB','01001':'ROCK','10001':'SHAKA','11000':'GUN','00001':'PINKY','00100':'MIDDLE'};
+const HC=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function chips(){
+  if(st==='setg')$('chips').textContent=gSeq.map(o=>GN[o.g]||'CUSTOM').join('  >  ');
+  else if(st==='hand')$('chips').textContent='●'.repeat(gSeq.length)+'○'.repeat(Math.max(0,seq.length-gSeq.length));
+  else $('chips').textContent='';
+  show('sv',st==='setg'&&gSeq.length>=3);
+}
+function enter(s){
+  vTok++;st=s;holdT=0;gT=0;cur='';lastG='';armed=true;samples=[];score=null;$('live').textContent='';embs=[];fcos=null;anc=null;acc=null;lastV=null;
+  if(s==='setg'||s==='hand')gSeq=[];
+  const M={enroll:['ENROLL YOUR FACE','LOOK STRAIGHT AT THE CAMERA'],face:['FACE SCAN','LOOK AT THE CAMERA'],setg:['SET YOUR HAND SEQUENCE','SHOW 3 TO 6 SIGNS. HOLD EACH ONE STEADY.'],hand:['SHOW YOUR HAND SEQUENCE','HOLD EACH SIGN STEADY']}[s];
+  if(M)say(M[0],M[1]);
+  show('cl',s==='setg');show('cs',0);show('rf',0);show('rv',0);show('lk',0);
+  show('alt',(s==='voice'&&!!seq)||(s==='hand'&&!!vT)||s==='enrollv'||(s==='setg'&&!vT));$('alt').textContent=(s==='hand'||s==='setg')?'USE VOICE INSTEAD':'USE SIGNS INSTEAD';chips();
+  if(s==='voice'||s==='enrollv')vlisten();
+}
+function fail(m,s){flash=1;flashCol='#ff3b5c';say(m,s,'var(--bad)');gSeq=[];chips();const k=st;setTimeout(()=>{if(st===k)enter(k)},1100)}
+let ut=null;
+function grant(){ut=setTimeout(()=>{try{window.Android&&Android.unlock()}catch(e){}},3000);st='granted';grantT=0;flash=1;flashCol='#7dffb2';say('ACCESS GRANTED','CLOSING IN 3 SECONDS. TAP A BUTTON TO STAY.','var(--ok)');$('live').textContent='';$('chips').textContent='';show('sv',0);show('cl',0);show('lk',1);show('cs',1);show('rf',1);show('rv',1);show('alt',0);$('rv').textContent=vT?'RE-RECORD VOICE':'SET UP VOICE'}
+
+// ---- face signature: normalized landmark geometry ----
+function norm(L){
+  const n=L.length,vw=v.videoWidth,vh=v.videoHeight,p=L.map(l=>[l.x*vw,l.y*vh,l.z*vw]);
+  let cx=0,cy=0,cz=0;p.forEach(q=>{cx+=q[0];cy+=q[1];cz+=q[2]});cx/=n;cy/=n;cz/=n;
+  const a=Math.atan2(p[263][1]-p[33][1],p[263][0]-p[33][0]),co=Math.cos(-a),si=Math.sin(-a);let s=0;
+  const o=p.map(q=>{const X=q[0]-cx,Y=q[1]-cy,Z=q[2]-cz,r=[X*co-Y*si,X*si+Y*co,Z];s+=r[0]*r[0]+r[1]*r[1]+r[2]*r[2];return r});
+  s=Math.sqrt(s/n);return o.flat().map(u=>u/s);
+}
+const dist=(a,b)=>{let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return Math.sqrt(s/(a.length/3))};
+
+// ---- hand sign: which of the 5 fingers are extended ----
+function sign(L){
+  const w=v.videoWidth,h=v.videoHeight,d=(a,b)=>Math.hypot((L[a].x-L[b].x)*w,(L[a].y-L[b].y)*h,(L[a].z-L[b].z)*w);
+  const f=[d(4,17)>d(3,17)*1.08?1:0];
+  [[8,6],[12,10],[16,14],[20,18]].forEach(q=>f.push(d(q[0],0)>d(q[1],0)*1.12?1:0));
+  return f.join('');
+}
+
+function detect(ts){
+  if(st==='enroll'||st==='face'){const r=fl.detectForVideo(v,ts);fr=r.faceLandmarks[0]||null;hr=null}
+  else{const r=hd.detectForVideo(v,ts);hr=r.landmarks[0]||null;fr=null}
+}
+function logic(dt){
+  if(st==='enroll'){
+    if(fr){sampT+=dt;if(sampT>.1){sampT=0;samples.push(norm(fr));
+      if(fmState==='ready'&&!fbusy&&embs.length<8&&samples.length%3===0){fbusy=true;faceVec(fr).then(e=>embs.push(e)).catch(()=>{}).finally(()=>{fbusy=false})}}}
+    if(samples.length>=25&&(embs.length>=6||fmState!=='ready')){
+      const n=samples[0].length,m=new Array(n).fill(0);samples.forEach(q=>q.forEach((u,i)=>m[i]+=u/samples.length));
+      face=m.map(u=>+u.toFixed(4));try{localStorage.setItem('hf',JSON.stringify(face))}catch(e){}
+      if(embs.length){const sm=embs[0].map((_,i)=>embs.reduce((q,e)=>q+e[i],0)),nn=Math.hypot(...sm);hfe=sm.map(u=>+(u/nn).toFixed(4));try{localStorage.setItem('hfe',JSON.stringify(hfe))}catch(e){}}
+      else{hfe=null;try{localStorage.removeItem('hfe')}catch(e){}}
+      flash=1;flashCol='#7dffb2';enter((vT||seq)?'face':'enrollv');
+    }
+  }else if(st==='face'){
+    if(!fr){holdT=0;$('live').textContent='NO FACE FOUND';return}
+    if(hfe&&fmState==='loading'){holdT=0;$('live').textContent='LOADING FACE MODEL...';return}
+    if(hfe&&fmState==='ready'){
+      const now=performance.now();
+      if(!fbusy&&now-fcosT>250){fbusy=true;faceVec(fr).then(e=>{fcos=dot(e,hfe);fcosT=performance.now();fmErr=0}).catch(()=>{fcos=null;fcosT=performance.now();if(++fmErr>3)fmState='failed'}).finally(()=>{fbusy=false})}
+      const ok=fcos!==null&&now-fcosT<900&&fcos>=FT;
+      if(ok)holdT+=dt;else holdT=Math.max(0,holdT-dt);
+      $('live').textContent='FACE MATCH '+(fcos===null?'...':fcos.toFixed(2))+' (NEEDS '+FT+'+)';
+    }else{
+      const d=dist(norm(fr),face);if(d<TH)holdT+=dt;else holdT=Math.max(0,holdT-dt);
+      $('live').textContent='BASIC FACE MATCH '+d.toFixed(3)+' (NEEDS UNDER '+TH+')';
+    }
+    if(holdT>=1){
+      if(fmState==='ready'&&!hfe){faceVec(fr).then(e=>{hfe=e.map(u=>+u.toFixed(4));try{localStorage.setItem('hfe',JSON.stringify(hfe))}catch(_){}}).catch(()=>{})}
+      flash=1;flashCol='#7dffb2';enter(vT?'voice':(seq?'hand':'enrollv'))}
+  }else if(st==='setg'||st==='hand'){
+    const vec=hr?pose(hr):null;
+    $('live').textContent=vec?(st==='setg'?'DETECTED: '+(GN[sign(hr)]||'CUSTOM SIGN'):'HAND DETECTED'):'SHOW YOUR HAND';
+    if(!vec){anc=null;gT=0;armed=true;return}
+    if(!armed){if(lastV&&sd(vec,lastV)>.5)armed=true;gT=0;return}
+    if(!anc||sd(vec,anc)>.25){anc=vec;acc=vec.slice();accN=1;gT=0;return}
+    gT+=dt;accN++;for(let i=0;i<acc.length;i++)acc[i]+=(vec[i]-acc[i])/accN;
+    if(gT>=.9){
+      const m=acc.slice(),lab=sign(hr);armed=false;lastV=m;gT=0;anc=null;
+      if(st==='setg'){gSeq.push({v:m.map(u=>+u.toFixed(2)),g:lab});if(gSeq.length>=6)saveSeq();else chips()}
+      else{const k=gSeq.length,d=sd(m,seq[k].v);gSeq.push(1);
+        if(d>=ST)fail('ACCESS DENIED','WRONG SEQUENCE (SIGN '+(k+1)+' OFF BY '+d.toFixed(2)+'). TRY AGAIN.');
+        else if(gSeq.length===seq.length)grant();else chips()}
+    }
+  }
+}
+function saveSeq(){seq=gSeq.slice();try{localStorage.setItem('hs',JSON.stringify(seq))}catch(e){}flash=1;flashCol='#7dffb2';enter('hand');say('SEQUENCE SAVED','NOW SHOW IT AGAIN TO UNLOCK','var(--ok)')}
+
+// ---- voice: MFCC features + DTW template match (checks phrase and voice, not words) ----
+function fft(re,im){const n=re.length;
+  for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]]}}
+  for(let len=2;len<=n;len<<=1){const a=-2*Math.PI/len,wr=Math.cos(a),wi=Math.sin(a),h=len/2;
+    for(let i=0;i<n;i+=len){let cr=1,ci=0;for(let k=0;k<h;k++){
+      const ur=re[i+k],ui=im[i+k],xr=re[i+k+h],xi=im[i+k+h],vr=xr*cr-xi*ci,vi=xr*ci+xi*cr;
+      re[i+k]=ur+vr;im[i+k]=ui+vi;re[i+k+h]=ur-vr;im[i+k+h]=ui-vi;const t=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=t}}}}
+function mfcc(x){
+  const N=512,H=160,F=400,NM=26,sr=16000,mel=f=>2595*Math.log10(1+f/700),imel=m=>700*(10**(m/2595)-1);
+  const pts=[...Array(NM+2)].map((_,i)=>imel(mel(80)+(mel(7600)-mel(80))*i/(NM+1))),bin=pts.map(f=>Math.floor((N+1)*f/sr));
+  const win=[...Array(F)].map((_,i)=>.54-.46*Math.cos(2*Math.PI*i/(F-1))),C=[],E=[];
+  for(let s=0;s+F<=x.length;s+=H){
+    const re=new Float64Array(N),im=new Float64Array(N);let e=0;
+    for(let i=0;i<F;i++){const v=(x[s+i]-(i?.97*x[s+i-1]:0))*win[i];re[i]=v;e+=v*v}
+    fft(re,im);const P=[];for(let k=0;k<=N/2;k++)P[k]=re[k]*re[k]+im[k]*im[k];
+    const L=[];for(let m=1;m<=NM;m++){let a=0;
+      for(let k=bin[m-1];k<bin[m];k++)a+=P[k]*(k-bin[m-1])/Math.max(1,bin[m]-bin[m-1]);
+      for(let k=bin[m];k<bin[m+1];k++)a+=P[k]*(bin[m+1]-k)/Math.max(1,bin[m+1]-bin[m]);
+      L.push(Math.log(a+1e-10))}
+    const c=[];for(let k=1;k<=12;k++){let a=0;for(let m=0;m<NM;m++)a+=L[m]*Math.cos(Math.PI*k*(m+.5)/NM);c.push(a)}
+    C.push(c);E.push(e)}
+  const mx=Math.max(...E),th=mx*.02;let a=E.findIndex(e=>e>th),b=E.length-1-[...E].reverse().findIndex(e=>e>th);
+  if(a<0||b-a<20||mx<1e-4)return null;
+  const R=C.slice(a,b+1),mu=new Array(12).fill(0);R.forEach(r=>r.forEach((v,i)=>mu[i]+=v/R.length));
+  return R.map(r=>r.map((v,i)=>v-mu[i]));
+}
+function dtw(a,b){const n=a.length,m=b.length;let pv=new Float64Array(m+1).fill(1e9),cu;pv[0]=0;
+  for(let i=1;i<=n;i++){cu=new Float64Array(m+1).fill(1e9);
+    for(let j=1;j<=m;j++){let d=0;for(let k=0;k<12;k++){const t=a[i-1][k]-b[j-1][k];d+=t*t}
+      cu[j]=Math.sqrt(d)+Math.min(pv[j],pv[j-1],cu[j-1])}pv=cu}
+  return pv[m]/(n+m)}
+async function rec(ms){
+  if(!aud||!aud.length)throw Error('Microphone not available');
+  aud.forEach(t=>t.enabled=true);const s=new MediaStream(aud);
+  ac=ac||new (window.AudioContext||window.webkitAudioContext)();
+  if(ac.state!=='running')await ac.resume();
+  const src=ac.createMediaStreamSource(s),sp=ac.createScriptProcessor(4096,1,1),g=ac.createGain(),ch=[];g.gain.value=0;
+  sp.onaudioprocess=e=>ch.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(sp);sp.connect(g);g.connect(ac.destination);
+  await sl(ms);
+  try{src.disconnect();sp.disconnect();g.disconnect()}catch(e){}aud.forEach(t=>t.enabled=false);
+  const n=ch.reduce((q,c)=>q+c.length,0),x=new Float32Array(n);let o=0;ch.forEach(c=>{x.set(c,o);o+=c.length});
+  if(!n)throw Error('No audio received from microphone');
+  const r=ac.sampleRate/16000,out=new Float32Array(Math.floor(n/r));
+  for(let i=0;i<out.length;i++){let q=0,c=0;for(let j=Math.floor(i*r);j<Math.floor((i+1)*r)&&j<n;j++){q+=x[j];c++}out[i]=c?q/c:0}
+  return out;
+}
+// ---- speaker-recognition model (WavLM x-vector): who is speaking ----
+let svp=null;
+async function loadSV(){
+  if(svp)return svp;
+  say('LOADING VOICE MODEL','FIRST TIME DOWNLOADS ABOUT 100 MB. KEEP INTERNET ON.');
+  const T=await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2');
+  T.env.allowLocalModels=false;T.env.backends.onnx.wasm.numThreads=1;
+  const id='Xenova/wavlm-base-plus-sv';
+  svp={proc:await T.AutoProcessor.from_pretrained(id),model:await T.AutoModel.from_pretrained(id)};
+  return svp;
+}
+async function embed(x){
+  const p=await loadSV(),o=await p.model(await p.proc(x)),e=Array.from(o.embeddings.data),n=Math.hypot(...e);
+  return e.map(v=>v/n);
+}
+const dot=(a,b)=>a.reduce((q,v,i)=>q+v*b[i],0);
+// Unlock needs BOTH: the right voice (model) AND the right phrase (sound pattern + length).
+async function vlisten(){
+  const k=++vTok,en=st==='enrollv',T=[],E=[];
+  try{
+    await loadSV();if(k!==vTok)return;
+    while(k===vTok){
+      const ttl=en?'RECORD YOUR PHRASE '+(T.length+1)+' OF 3':'SAY YOUR PHRASE';
+      say(ttl,'GET READY...');await sl(900);if(k!==vTok)return;
+      say(ttl,'SPEAK NOW');recStart=performance.now();recMs=3000;
+      const raw=await rec(3000);recMs=0;if(k!==vTok)return;
+      const m=mfcc(raw);
+      if(!m){say('TOO QUIET','SPEAK LOUDER AND CLOSER');await sl(1100);continue}
+      say('CHECKING VOICE...','ONE MOMENT');
+      const e=await embed(raw);if(k!==vTok)return;
+      if(en){
+        T.push(m);E.push(e);
+        if(T.length===3){
+          const pr=[[0,1],[0,2],[1,2]],sim=Math.min(...pr.map(q=>dot(E[q[0]],E[q[1]])));
+          if(sim<0.8){T.length=0;E.length=0;say('RECORDINGS TOO DIFFERENT','SAME PHRASE, QUIET ROOM. STARTING AGAIN.','var(--bad)');await sl(2200);continue}
+          let sm=0;pr.forEach(q=>sm+=dtw(T[q[0]],T[q[1]]));
+          const sum=E[0].map((_,i)=>E[0][i]+E[1][i]+E[2][i]),nn=Math.hypot(...sum);
+          vT={t:T.map(q=>q.map(r=>r.map(v=>+v.toFixed(2)))),th:sm/3*VF,e:sum.map(v=>+(v/nn).toFixed(4))};
+          try{localStorage.setItem('hv',JSON.stringify(vT))}catch(_){}
+          flash=1;flashCol='#7dffb2';enter('face');return}
+        say('GOT IT','NEXT ONE...');await sl(700);
+      }else{
+        const d=vT.t.reduce((a,q)=>a+dtw(m,q),0)/vT.t.length,cs=dot(e,vT.e),L=vT.t.reduce((a,q)=>a+q.length,0)/vT.t.length,r=m.length/L;
+        $('live').textContent='VOICE '+cs.toFixed(2)+' (NEEDS '+EV+'+)  PHRASE '+d.toFixed(1)+' (NEEDS UNDER '+vT.th.toFixed(1)+')';
+        if(cs>=EV&&d<vT.th&&r>.65&&r<1.5){grant();return}
+        flash=1;flashCol='#ff3b5c';say('ACCESS DENIED','VOICE OR PHRASE MISMATCH. TRY AGAIN.','var(--bad)');await sl(1500);
+      }
+    }
+  }catch(e){if(k===vTok){say('VOICE ERROR',((e&&(e.name+': '+e.message))||'ERROR')+(seq?'. SWITCHING TO SIGNS...':'. TAP USE SIGNS INSTEAD.'),'var(--bad)');if(seq){await sl(2500);if(k===vTok)enter('hand')}}}
+}
+
+// ---- on-device face recognition model (ArcFace-style, ONNX) ----
+async function getBuf(u){
+  try{const c=await caches.open('fm');let r=await c.match(u);if(!r){r=await fetch(u);if(!r.ok)throw 0;await c.put(u,r.clone())}return await r.arrayBuffer()}
+  catch(e){const r=await fetch(u);if(!r.ok)throw Error('download failed');return await r.arrayBuffer()}
+}
+async function loadFM(){
+  fmState='loading';
+  try{
+    await new Promise((ok,no)=>{const t=document.createElement('script');t.src=ORT+'ort.min.js';t.onload=ok;t.onerror=()=>no(Error('runtime load failed'));document.head.appendChild(t)});
+    ort.env.wasm.wasmPaths=ORT;ort.env.wasm.numThreads=1;
+    for(const u of FMU){try{fmS=await ort.InferenceSession.create(new Uint8Array(await getBuf(u)),{executionProviders:['wasm']});break}catch(e){}}
+  }catch(e){}
+  fmState=fmS?'ready':'failed';
+}
+function simT(S,D){const n=S.length;let mx=0,my=0,qx=0,qy=0;
+  S.forEach((p,i)=>{mx+=p[0]/n;my+=p[1]/n;qx+=D[i][0]/n;qy+=D[i][1]/n});
+  let n1=0,n2=0,dn=0;
+  S.forEach((p,i)=>{const px=p[0]-mx,py=p[1]-my,ux=D[i][0]-qx,uy=D[i][1]-qy;n1+=px*ux+py*uy;n2+=px*uy-py*ux;dn+=px*px+py*py});
+  const a=n1/dn,b=n2/dn;return[a,b,qx-(a*mx-b*my),qy-(b*mx+a*my)]}
+const fc=document.createElement('canvas');fc.width=fc.height=112;
+const fx=fc.getContext('2d',{willReadFrequently:true});
+const TPL=[[38.2946,51.6963],[73.5318,51.5014],[56.0252,71.7366],[41.5493,92.3655],[70.7299,92.2041]];
+async function faceVec(L){
+  const w=v.videoWidth,h=v.videoHeight,P=i=>[L[i].x*w,L[i].y*h],mid=(i,j)=>{const a=P(i),b=P(j);return[(a[0]+b[0])/2,(a[1]+b[1])/2]};
+  const [a,b,tx,ty]=simT([mid(33,133),mid(263,362),P(1),P(61),P(291)],TPL);
+  fx.setTransform(1,0,0,1,0,0);fx.clearRect(0,0,112,112);fx.setTransform(a,b,-b,a,tx,ty);fx.drawImage(v,0,0);fx.setTransform(1,0,0,1,0,0);
+  const d=fx.getImageData(0,0,112,112).data,f=new Float32Array(3*112*112);
+  for(let i=0;i<12544;i++){f[i]=(d[i*4]-127.5)/127.5;f[i+12544]=(d[i*4+1]-127.5)/127.5;f[i+25088]=(d[i*4+2]-127.5)/127.5}
+  const o=await fmS.run({[fmS.inputNames[0]]:new ort.Tensor('float32',f,[1,3,112,112])});
+  const e=Array.from(o[fmS.outputNames[0]].data),n=Math.hypot(...e);return e.map(q=>q/n);
+}
+// ---- hand pose: 21 joints normalised for position, size and rotation ----
+function pose(L){
+  const w=v.videoWidth,h=v.videoHeight,P=L.map(l=>[l.x*w,l.y*h,l.z*w]),o=P[0],u=[P[9][0]-o[0],P[9][1]-o[1]],sc=Math.hypot(u[0],u[1])||1,t=-Math.atan2(u[0],-u[1]),co=Math.cos(t),si=Math.sin(t);
+  return P.flatMap(q=>{const X=q[0]-o[0],Y=q[1]-o[1],Z=q[2]-o[2];return[(X*co-Y*si)/sc,(X*si+Y*co)/sc,Z/sc]});
+}
+const sd=(a,b)=>{let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return Math.sqrt(s/(a.length/3))};
+
+// ---- setup ----
+async function boot(){
+  try{ac=ac||new (window.AudioContext||window.webkitAudioContext)()}catch(e){}
+  try{
+    say('STARTING CAMERA','ALLOW ACCESS WHEN ASKED');
+    const vc={facingMode:'user',width:640,height:480},gm=navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    let stream;
+    try{stream=await gm({video:vc,audio:{echoCancellation:false,noiseSuppression:false}})}  // camera + mic in ONE request
+    catch(e){stream=await gm({video:vc,audio:false})}                                      // mic unavailable: still allow face + signs
+    aud=stream.getAudioTracks();aud.forEach(t=>t.enabled=false);
+    v.srcObject=stream;
+    await v.play();v.style.display='block';
+    say('LOADING NEURAL MODELS','FIRST LOAD TAKES A MOMENT');
+    const fs=await FilesetResolver.forVisionTasks(CDN+'/wasm');
+    const mk=async(C,url,o)=>{for(const d of['GPU','CPU']){try{return await C.createFromOptions(fs,{baseOptions:{modelAssetPath:url,delegate:d},runningMode:'VIDEO',...o})}catch(e){}}throw Error('Model load failed')};
+    hd=await mk(HandLandmarker,MD+'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',{numHands:1});
+    fl=await mk(FaceLandmarker,MD+'face_landmarker/face_landmarker/float16/1/face_landmarker.task',{numFaces:1});
+    say('LOADING FACE MODEL','FIRST TIME DOWNLOADS ABOUT 15 MB. KEEP INTERNET ON.');await loadFM();
+    vReady=true;enter(face?'face':'enroll');
+  }catch(e){st='boot';say('START FAILED',((e&&(e.message||e.name))||'ERROR')+'. NEEDS HTTPS AND CAMERA. TAP TO RETRY.','var(--bad)')}
+}
+c.addEventListener('pointerdown',()=>{if(st==='boot'){st='load';boot()}});
+$('sv').onclick=saveSeq;$('cl').onclick=()=>{gSeq=[];chips()};
+$('lk').onclick=()=>{clearTimeout(ut);enter('face')};
+$('rv').onclick=()=>{clearTimeout(ut);vT=null;try{localStorage.removeItem('hv')}catch(e){}enter('enrollv')};
+$('alt').onclick=()=>{if(st==='voice')enter('hand');else if(st==='hand')enter('voice');else if(st==='enrollv')enter(seq?'hand':'setg');else if(st==='setg')enter('enrollv')};
+$('cs').onclick=()=>{clearTimeout(ut);seq=null;try{localStorage.removeItem('hs')}catch(e){}enter('setg')};
+$('rf').onclick=()=>{clearTimeout(ut);face=null;hfe=null;try{localStorage.removeItem('hf');localStorage.removeItem('hfe')}catch(e){}enter('enroll')};
+
+// ---- drawing ----
+function map(l){const vw=v.videoWidth,vh=v.videoHeight,s=Math.max(W/vw,H/vh);return[W-(l.x*vw*s+(W-vw*s)/2),l.y*vh*s+(H-vh*s)/2]}
+function ring(cx,cy,r,w,dash,spd){x.save();x.translate(cx,cy);x.rotate(t*spd);x.setLineDash(dash);x.lineWidth=w;x.beginPath();x.arc(0,0,r,0,7);x.stroke();x.restore()}
+function loop(ts){
+  const dt=Math.min((ts-last)/1000||0,.05);last=ts;t=ts/1000;
+  if(vReady&&v.currentTime!==lastVT&&['enroll','face','setg','hand'].includes(st)){lastVT=v.currentTime;try{detect(ts);logic(dt)}catch(e){}}
+  x.clearRect(0,0,W,H);
+  const cx=W/2,cy=H*.5,R=Math.min(W,H)*.3,ok=st==='granted',col=ok?'#7dffb2':'#00e5ff',f=(st==='load'||st==='enroll')?3:1;
+  x.fillStyle='rgba(0,229,255,.5)';
+  P.forEach(p=>{p.y-=p.v*dt;if(p.y<0)p.y=1;x.beginPath();x.arc(p.x*W,p.y*H,p.r,0,7);x.fill()});
+  x.shadowColor=col;x.shadowBlur=12;x.strokeStyle=col;x.fillStyle=col;x.globalAlpha=.85+.15*Math.sin(t*40)*Math.sin(t*3);
+  ring(cx,cy,R*1.15,1.5,[40,14],.3*f);ring(cx,cy,R*.95,1,[3,9],-.25*f);ring(cx,cy,R*.75,3,[90,30],.5*f);ring(cx,cy,R*.5,1,[2,6],-.8*f);
+  x.setLineDash([]);x.lineWidth=2;
+  if(st==='boot'){x.beginPath();x.arc(cx,cy,7+3*Math.sin(t*3),0,7);x.fill();say&&($('msg').textContent||say('TAP TO INITIALIZE','CAMERA AND HAND TRACKING'))}
+  const prog=st==='enroll'?samples.length/25:st==='face'?holdT:(st==='setg'||st==='hand')?gT/.9:(st==='voice'||st==='enrollv')?(recMs?Math.min((performance.now()-recStart)/recMs,1):0):0;
+  if(prog>0){x.lineWidth=4;x.beginPath();x.arc(cx,cy,R*1.3,-Math.PI/2,-Math.PI/2+Math.PI*2*Math.min(prog,1));x.stroke()}
+  if(fr){x.globalAlpha=.8;for(let i=0;i<fr.length;i+=2){const p=map(fr[i]);x.fillRect(p[0],p[1],2,2)}}
+  if(hr){x.globalAlpha=1;x.strokeStyle='#fff';x.lineWidth=2;x.beginPath();HC.forEach(e=>{const a=map(hr[e[0]]),b=map(hr[e[1]]);x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1])});x.stroke();
+    x.fillStyle=col;hr.forEach(l=>{const p=map(l);x.beginPath();x.arc(p[0],p[1],4,0,7);x.fill()})}
+  if(ok){grantT+=dt;x.globalAlpha=Math.max(0,1-grantT/1.4);x.strokeStyle=col;x.lineWidth=4;x.beginPath();x.arc(cx,cy,grantT*W*.6,0,7);x.stroke();x.globalAlpha=1;
+    x.lineWidth=5;x.beginPath();x.moveTo(cx-R*.2,cy);x.lineTo(cx-R*.05,cy+R*.15);x.lineTo(cx+R*.22,cy-R*.15);x.stroke()}
+  x.shadowBlur=0;x.globalAlpha=1;
+  if(flash>0){x.globalAlpha=flash*.18;x.fillStyle=flashCol;x.fillRect(0,0,W,H);x.globalAlpha=1;flash-=dt*1.5}
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
